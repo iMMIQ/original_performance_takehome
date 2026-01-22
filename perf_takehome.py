@@ -232,6 +232,7 @@ class KernelBuilder:
         v_zero = self.alloc_scratch("v_zero", VLEN)
         v_one = self.alloc_scratch("v_one", VLEN)
         v_two = self.alloc_scratch("v_two", VLEN)
+        v_n_nodes = self.alloc_scratch("v_n_nodes", VLEN)
 
         # Hash constant vectors
         hconsts = []
@@ -263,6 +264,8 @@ class KernelBuilder:
         init_slots.append(("valu", ("vbroadcast", v_zero, zero)))
         init_slots.append(("valu", ("vbroadcast", v_one, one)))
         init_slots.append(("valu", ("vbroadcast", v_two, two)))
+        # Broadcast n_nodes for vector bounds check
+        init_slots.append(("valu", ("vbroadcast", v_n_nodes, self.scratch["n_nodes"])))
 
         # Initialize hash constants
         for (vc1, vc3), (op1, val1, op2, op3, val3) in zip(hconsts, HASH_STAGES):
@@ -283,19 +286,13 @@ class KernelBuilder:
             for vec_idx in range(n_vectors):
                 offset = vec_idx * VLEN
 
-                # Load idx/val vectors - pack as much as possible
-                slots = [
-                    ("flow", ("add_imm", tmp_addr, self.scratch["inp_indices_p"], offset)),
-                    ("load", ("vload", v_idx, tmp_addr)),
-                ]
-                self.instrs.extend(self.build(slots))
-                slots = [
-                    ("flow", ("add_imm", tmp_addr, self.scratch["inp_values_p"], offset)),
-                    ("load", ("vload", v_val, tmp_addr)),
-                ]
-                self.instrs.extend(self.build(slots))
+                # Load idx/val vectors
+                self.add("flow", ("add_imm", tmp_addr, self.scratch["inp_indices_p"], offset))
+                self.add("load", ("vload", v_idx, tmp_addr))
+                self.add("flow", ("add_imm", tmp_addr, self.scratch["inp_values_p"], offset))
+                self.add("load", ("vload", v_val, tmp_addr))
 
-                # Gather node_vals - don't pack due to tmp_addr/tmp0 dependencies
+                # Gather node_vals - pack in small groups without RAW conflicts
                 for i in range(VLEN):
                     idx_pos = v_idx + i
                     node_pos = v_node_val + i
@@ -312,17 +309,20 @@ class KernelBuilder:
                     self.add("valu", (op3, v_node_val, v_val, vc3))
                     self.add("valu", (op2, v_val, v_hash_tmp, v_node_val))
 
-                # Compute next idx
+                # Compute next idx - optimized version
+                # even = val % 2 (0 for even, 1 for odd)
                 self.add("valu", ("%", v_even, v_val, v_two))
-                self.add("valu", ("==", v_even, v_even, v_zero))
-                self.add("flow", ("vselect", v_offset, v_even, v_one, v_two))
+                # offset = 1 + even (if even=0, offset=1; if even=1, offset=2)
+                self.add("valu", ("+", v_offset, v_one, v_even))
+                # idx = idx * 2 + offset
                 self.add("valu", ("*", v_idx, v_idx, v_two))
                 self.add("valu", ("+", v_idx, v_idx, v_offset))
 
-                # Bounds check and wrap
-                for i in range(VLEN):
-                    self.add("alu", ("<", v_cmp + i, v_idx + i, self.scratch["n_nodes"]))
-                    self.add("flow", ("select", v_idx + i, v_cmp + i, v_idx + i, v_zero))
+                # Bounds check and wrap - use vector operations
+                # v_cmp = (v_idx < v_n_nodes)
+                self.add("valu", ("<", v_cmp, v_idx, v_n_nodes))
+                # v_idx = vselect(v_cmp, v_idx, v_zero) - keep idx if in bounds, else 0
+                self.add("flow", ("vselect", v_idx, v_cmp, v_idx, v_zero))
 
                 # Store results
                 self.add("flow", ("add_imm", tmp_addr, self.scratch["inp_indices_p"], offset))
@@ -330,7 +330,7 @@ class KernelBuilder:
                 self.add("flow", ("add_imm", tmp_addr, self.scratch["inp_values_p"], offset))
                 self.add("store", ("vstore", tmp_addr, v_val))
 
-        self.instrs.append({"flow": [("pause",)]})
+        self.add("flow", ("pause",))
 
 BASELINE = 147734
 
