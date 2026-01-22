@@ -49,10 +49,120 @@ class KernelBuilder:
         return DebugInfo(scratch_map=self.scratch_debug)
 
     def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = False):
-        # Simple slot packing that just uses one slot per instruction bundle
+        """
+        Pack multiple slots into VLIW instruction bundles.
+        Each instruction can contain multiple engine slots executing in parallel.
+
+        This version respects RAW (Read-After-Write) dependencies by tracking which
+        scratch locations are written in the current instruction.
+        """
         instrs = []
-        for engine, slot in slots:
-            instrs.append({engine: [slot]})
+        i = 0
+        n = len(slots)
+
+        while i < n:
+            instr = {}
+            # Track used slots per engine
+            used_slots = {}
+            # Track written scratch locations in this instruction (for dependency checking)
+            written = set()
+
+            j = i
+            # Greedy packing: add slots until we hit a limit or dependency
+            while j < n:
+                engine, slot = slots[j]
+                used = used_slots.get(engine, 0)
+
+                if used >= SLOT_LIMITS.get(engine, 1):
+                    # This engine is full, end this instruction
+                    break
+
+                # Check for RAW dependencies: does this slot read anything written earlier?
+                can_add = True
+                sources = []
+                written_dest = None
+
+                if engine == "alu":
+                    # Format: (op, dest, src1, src2)
+                    sources = [slot[2], slot[3]]
+                    written_dest = slot[1]
+                elif engine == "load":
+                    if slot[0] == "const":
+                        # ("const", dest, val) - val is immediate, not scratch
+                        sources = []
+                    else:
+                        # ("load", dest, addr) - addr is scratch
+                        sources = [slot[2]]
+                    written_dest = slot[1]
+                elif engine == "store":
+                    # Format: ("store", addr, src)
+                    sources = [slot[1], slot[2]]
+                    written_dest = None
+                elif engine == "debug":
+                    # Format: ("compare", loc, key)
+                    sources = [slot[1]]  # loc
+                    written_dest = None
+                elif engine == "flow":
+                    op = slot[0]
+                    if op == "select":
+                        # ("select", dest, cond, a, b)
+                        sources = [slot[2], slot[3], slot[4]]
+                        written_dest = slot[1]
+                    elif op == "add_imm":
+                        # ("add_imm", dest, a, imm) - imm is immediate
+                        sources = [slot[2]]
+                        written_dest = slot[1]
+                    elif op == "vselect":
+                        # ("vselect", dest, cond, a, b)
+                        sources = [slot[2], slot[3], slot[4]]
+                        written_dest = slot[1]
+                    else:
+                        # Other flow ops (jump, halt, pause, etc.)
+                        sources = []
+                        written_dest = None
+                else:
+                    # Unknown engine
+                    sources = []
+                    written_dest = None
+
+                # Check if any source was written earlier in this instruction
+                for src in sources:
+                    if src in written:
+                        can_add = False
+                        break
+
+                if not can_add:
+                    break
+
+                # Add this slot
+                if engine not in instr:
+                    instr[engine] = []
+                instr[engine].append(slot)
+                used_slots[engine] = used + 1
+
+                # Track the destination as written
+                if written_dest is not None:
+                    written.add(written_dest)
+
+                j += 1
+
+                # Check if any engine can still accept more slots
+                can_add_more = False
+                k = j
+                while k < n:
+                    next_engine, _ = slots[k]
+                    if used_slots.get(next_engine, 0) < SLOT_LIMITS.get(next_engine, 1):
+                        can_add_more = True
+                        break
+                    k += 1
+
+                if not can_add_more:
+                    break
+
+            if instr:
+                instrs.append(instr)
+            i = j
+
         return instrs
 
     def add(self, engine, slot):
