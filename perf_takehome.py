@@ -224,14 +224,14 @@ class KernelBuilder:
         v_val = self.alloc_scratch("v_val", VLEN)
         v_node_val = self.alloc_scratch("v_node_val", VLEN)
         v_hash_tmp = self.alloc_scratch("v_hash_tmp", VLEN)
-        v_even = self.alloc_scratch("v_even", VLEN)
-        v_offset = self.alloc_scratch("v_offset", VLEN)
+        v_parity = self.alloc_scratch("v_parity", VLEN)  # v_val & 1
         v_cmp = self.alloc_scratch("v_cmp", VLEN)
 
         # Constant vectors (broadcast via vbroadcast)
         v_zero = self.alloc_scratch("v_zero", VLEN)
         v_one = self.alloc_scratch("v_one", VLEN)
         v_two = self.alloc_scratch("v_two", VLEN)
+        v_three = self.alloc_scratch("v_three", VLEN)
         v_n_nodes = self.alloc_scratch("v_n_nodes", VLEN)
 
         # Hash constant vectors
@@ -261,9 +261,11 @@ class KernelBuilder:
         zero = self.scratch_const(0)
         one = self.scratch_const(1)
         two = self.scratch_const(2)
+        three = self.scratch_const(3)
         init_slots.append(("valu", ("vbroadcast", v_zero, zero)))
         init_slots.append(("valu", ("vbroadcast", v_one, one)))
         init_slots.append(("valu", ("vbroadcast", v_two, two)))
+        init_slots.append(("valu", ("vbroadcast", v_three, three)))
         # Broadcast n_nodes for vector bounds check
         init_slots.append(("valu", ("vbroadcast", v_n_nodes, self.scratch["n_nodes"])))
 
@@ -295,24 +297,28 @@ class KernelBuilder:
                 ]
                 self.instrs.extend(self.build(slots))
 
-                # Gather node_vals
-                for i in range(VLEN):
-                    idx_pos = v_idx + i
-                    node_pos = v_node_val + i
-                    self.add("alu", ("+", tmp_addr, self.scratch["forest_values_p"], idx_pos))
-                    self.add("load", ("load", tmp0, tmp_addr))
-                    self.add("alu", ("+", node_pos, tmp0, v_zero + i))
+                # Gather node_vals - pack iterations for better throughput
+                # Each iteration: alu(add) + load + flow(add_imm)
+                # By interleaving, we get 2 loads per cycle, but flow is bottleneck
+                # Pack pairs: (i=0,1), (i=2,3), (i=4,5), (i=6,7)
+                for i in range(0, VLEN, 2):
+                    idx_pos0 = v_idx + i
+                    idx_pos1 = v_idx + i + 1
+                    node_pos0 = v_node_val + i
+                    node_pos1 = v_node_val + i + 1
+                    slots = [
+                        ("alu", ("+", tmp_addr, self.scratch["forest_values_p"], idx_pos0)),
+                        ("alu", ("+", tmp0, self.scratch["forest_values_p"], idx_pos1)),
+                        ("load", ("load", node_pos0, tmp_addr)),
+                        ("load", ("load", node_pos1, tmp0)),
+                    ]
+                    self.instrs.extend(self.build(slots))
 
                 # XOR
                 self.add("valu", ("^", v_val, v_val, v_node_val))
 
-                # Hash: 6 stages - try packing all 18 ops into fewer instructions
-                # Each stage: op1, op3 can be parallel (both read v_val), op2 depends on both
-                # We can pack op1 and op3 of stage N with op1 of stage N+1 (if val hasn't changed)
-                # But op2 of each stage writes v_val, so stages must be sequential
-                # Let's try a different approach: pack the two independent ops of each stage
+                # Hash: 6 stages - pack each stage's first two ops (both read v_val)
                 for (op1, val1, op2, op3, val3), (vc1, vc3) in hash_stages:
-                    # Pack op1 and op3 (both read v_val, write different temps)
                     slots = [
                         ("valu", (op1, v_hash_tmp, v_val, vc1)),
                         ("valu", (op3, v_node_val, v_val, vc3)),
@@ -321,11 +327,12 @@ class KernelBuilder:
                     # Then op2 (reads both temps, writes v_val)
                     self.add("valu", (op2, v_val, v_hash_tmp, v_node_val))
 
-                # Compute next idx
-                self.add("valu", ("&", v_even, v_val, v_one))
-                self.add("valu", ("+", v_offset, v_one, v_even))
+                # Compute next idx - optimized with single vselect
+                # idx = idx * 2 + (val & 1 ? 2 : 1)  = idx * 2 + vselect(v_parity, v_two, v_one)
+                self.add("valu", ("&", v_parity, v_val, v_one))
                 self.add("valu", ("*", v_idx, v_idx, v_two))
-                self.add("valu", ("+", v_idx, v_idx, v_offset))
+                self.add("flow", ("vselect", v_hash_tmp, v_parity, v_two, v_one))
+                self.add("valu", ("+", v_idx, v_idx, v_hash_tmp))
                 # Bounds check and wrap
                 self.add("valu", ("<", v_cmp, v_idx, v_n_nodes))
                 self.add("flow", ("vselect", v_idx, v_cmp, v_idx, v_zero))
