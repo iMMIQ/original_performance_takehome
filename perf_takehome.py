@@ -306,28 +306,29 @@ class KernelBuilder:
                 # XOR
                 self.add("valu", ("^", v_val, v_val, v_node_val))
 
-                # Hash: 6 stages
+                # Hash: 6 stages - try packing all 18 ops into fewer instructions
+                # Each stage: op1, op3 can be parallel (both read v_val), op2 depends on both
+                # We can pack op1 and op3 of stage N with op1 of stage N+1 (if val hasn't changed)
+                # But op2 of each stage writes v_val, so stages must be sequential
+                # Let's try a different approach: pack the two independent ops of each stage
                 for (op1, val1, op2, op3, val3), (vc1, vc3) in hash_stages:
-                    self.add("valu", (op1, v_hash_tmp, v_val, vc1))
-                    self.add("valu", (op3, v_node_val, v_val, vc3))
+                    # Pack op1 and op3 (both read v_val, write different temps)
+                    slots = [
+                        ("valu", (op1, v_hash_tmp, v_val, vc1)),
+                        ("valu", (op3, v_node_val, v_val, vc3)),
+                    ]
+                    self.instrs.extend(self.build(slots))
+                    # Then op2 (reads both temps, writes v_val)
                     self.add("valu", (op2, v_val, v_hash_tmp, v_node_val))
 
-                # Compute next idx - optimized using & instead of %
-                # even = val & 1 (0 for even, 1 for odd) - same as val % 2 but faster
+                # Compute next idx
                 self.add("valu", ("&", v_even, v_val, v_one))
-                # offset = 1 + even (if even=0, offset=1; if even=1, offset=2)
                 self.add("valu", ("+", v_offset, v_one, v_even))
-                # idx = idx * 2 + offset
                 self.add("valu", ("*", v_idx, v_idx, v_two))
                 self.add("valu", ("+", v_idx, v_idx, v_offset))
-
-                # Bounds check and wrap - use vector operations
-                # v_cmp = (v_idx < v_n_nodes)
+                # Bounds check and wrap
                 self.add("valu", ("<", v_cmp, v_idx, v_n_nodes))
-                # v_idx = vselect(v_cmp, v_idx, v_zero) - keep idx if in bounds, else 0
                 self.add("flow", ("vselect", v_idx, v_cmp, v_idx, v_zero))
-
-                # Store results - pack both stores in one build call
                 slots = [
                     ("flow", ("add_imm", tmp_addr, self.scratch["inp_indices_p"], offset)),
                     ("store", ("vstore", tmp_addr, v_idx)),
