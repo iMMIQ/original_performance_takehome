@@ -286,19 +286,22 @@ class KernelBuilder:
             for vec_idx in range(n_vectors):
                 offset = vec_idx * VLEN
 
-                # Load idx/val vectors
-                self.add("flow", ("add_imm", tmp_addr, self.scratch["inp_indices_p"], offset))
-                self.add("load", ("vload", v_idx, tmp_addr))
-                self.add("flow", ("add_imm", tmp_addr, self.scratch["inp_values_p"], offset))
-                self.add("load", ("vload", v_val, tmp_addr))
+                # Load idx/val vectors - pack both loads in one build call
+                slots = [
+                    ("flow", ("add_imm", tmp_addr, self.scratch["inp_indices_p"], offset)),
+                    ("load", ("vload", v_idx, tmp_addr)),
+                    ("flow", ("add_imm", tmp_addr, self.scratch["inp_values_p"], offset)),
+                    ("load", ("vload", v_val, tmp_addr)),
+                ]
+                self.instrs.extend(self.build(slots))
 
-                # Gather node_vals - pack in small groups without RAW conflicts
+                # Gather node_vals
                 for i in range(VLEN):
                     idx_pos = v_idx + i
                     node_pos = v_node_val + i
                     self.add("alu", ("+", tmp_addr, self.scratch["forest_values_p"], idx_pos))
                     self.add("load", ("load", tmp0, tmp_addr))
-                    self.add("flow", ("add_imm", node_pos, tmp0, 0))
+                    self.add("alu", ("+", node_pos, tmp0, v_zero + i))
 
                 # XOR
                 self.add("valu", ("^", v_val, v_val, v_node_val))
@@ -309,9 +312,9 @@ class KernelBuilder:
                     self.add("valu", (op3, v_node_val, v_val, vc3))
                     self.add("valu", (op2, v_val, v_hash_tmp, v_node_val))
 
-                # Compute next idx - optimized version
-                # even = val % 2 (0 for even, 1 for odd)
-                self.add("valu", ("%", v_even, v_val, v_two))
+                # Compute next idx - optimized using & instead of %
+                # even = val & 1 (0 for even, 1 for odd) - same as val % 2 but faster
+                self.add("valu", ("&", v_even, v_val, v_one))
                 # offset = 1 + even (if even=0, offset=1; if even=1, offset=2)
                 self.add("valu", ("+", v_offset, v_one, v_even))
                 # idx = idx * 2 + offset
@@ -324,11 +327,14 @@ class KernelBuilder:
                 # v_idx = vselect(v_cmp, v_idx, v_zero) - keep idx if in bounds, else 0
                 self.add("flow", ("vselect", v_idx, v_cmp, v_idx, v_zero))
 
-                # Store results
-                self.add("flow", ("add_imm", tmp_addr, self.scratch["inp_indices_p"], offset))
-                self.add("store", ("vstore", tmp_addr, v_idx))
-                self.add("flow", ("add_imm", tmp_addr, self.scratch["inp_values_p"], offset))
-                self.add("store", ("vstore", tmp_addr, v_val))
+                # Store results - pack both stores in one build call
+                slots = [
+                    ("flow", ("add_imm", tmp_addr, self.scratch["inp_indices_p"], offset)),
+                    ("store", ("vstore", tmp_addr, v_idx)),
+                    ("flow", ("add_imm", tmp_addr, self.scratch["inp_values_p"], offset)),
+                    ("store", ("vstore", tmp_addr, v_val)),
+                ]
+                self.instrs.extend(self.build(slots))
 
         self.add("flow", ("pause",))
 
